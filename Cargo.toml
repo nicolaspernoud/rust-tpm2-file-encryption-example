@@ -1,0 +1,8 @@
+[package]
+name = "rust-tpm2-file-encryption-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bincode = "2.0.0-rc.3"
+tss-esapi = "8.0.0-alpha"
