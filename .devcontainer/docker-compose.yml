@@ -6,9 +6,12 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ../..:/workspaces:cached
+    devices:
+      - /dev/tpmrm0
     command: sleep infinity
     network_mode: host
     environment:
+      # TCTI: device:/dev/tpm0
       TPM2TOOLS_TCTI: mssim:host=localhost,port=2321
     deploy:
       resources:
