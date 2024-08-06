@@ -1,18 +1,32 @@
 use bincode::{config, Decode, Encode};
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::OsRng;
+use chacha20poly1305::AeadCore;
+use chacha20poly1305::ChaCha20Poly1305;
+use chacha20poly1305::KeyInit;
+use chacha20poly1305::Nonce;
 use core::str;
+use std::env;
 use std::fs;
-use std::{convert::TryFrom, env};
+use tss_esapi::interface_types::key_bits::RsaKeyBits;
+use tss_esapi::structures::Data;
+use tss_esapi::structures::HashScheme;
+use tss_esapi::structures::PublicKeyRsa;
+use tss_esapi::structures::PublicRsaParametersBuilder;
+use tss_esapi::structures::RsaDecryptionScheme;
+use tss_esapi::structures::RsaExponent;
+use tss_esapi::structures::RsaScheme;
 use tss_esapi::structures::{Private, Public};
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
     interface_types::{
-        algorithm::{HashingAlgorithm, PublicAlgorithm, SymmetricMode},
+        algorithm::{HashingAlgorithm, PublicAlgorithm},
         resource_handles::Hierarchy,
     },
     structures::{
-        CreatePrimaryKeyResult, Digest, InitialValue, MaxBuffer, PublicBuilder,
-        SymmetricCipherParameters, SymmetricDefinitionObject,
+        CreatePrimaryKeyResult, Digest, PublicBuilder, SymmetricCipherParameters,
+        SymmetricDefinitionObject,
     },
     Context, TctiNameConf,
 };
@@ -37,12 +51,13 @@ fn main() {
         let initial_data = fs::read(PLAIN_FILE_NAME).expect("could not read plain file");
         println!(
             "=== Initial data ===\n\n{}\n\n\n\n",
-            str::from_utf8(&initial_data).unwrap()
+            str::from_utf8(&initial_data).expect("could not convert initial data to UTF-8 string")
         );
         print!("");
         println!(
             "=== Decrypted data ===\n\n{}",
-            str::from_utf8(&decrypted_data).unwrap()
+            str::from_utf8(&decrypted_data)
+                .expect("could not convert decrypted data to UTF-8 string")
         );
         // They are the same!
         assert_eq!(initial_data, decrypted_data);
@@ -54,17 +69,19 @@ fn main() {
 #[derive(Encode, Decode, PartialEq, Debug)]
 struct BinaryEncryptedBundle {
     encrypted_data: Vec<u8>,
-    private_key: Vec<u8>,
-    public_key: Vec<u8>,
-    iv: Vec<u8>,
+    encrypted_symmetric_key: Vec<u8>,
+    tpm_public_key: Vec<u8>,
+    tpm_private_key: Vec<u8>,
+    nonce: Vec<u8>,
 }
 
 #[derive(PartialEq, Debug)]
 pub struct EncryptedBundle {
     encrypted_data: Vec<u8>,
-    private_key: Private,
-    public_key: Public,
-    iv: InitialValue,
+    encrypted_symmetric_key: PublicKeyRsa,
+    tpm_public_key: Public,
+    tpm_private_key: Private,
+    nonce: Nonce,
 }
 
 impl EncryptedBundle {
@@ -72,17 +89,19 @@ impl EncryptedBundle {
         let config = config::standard();
         let encrypted_bundle_file = fs::read(path).expect("could not open encrypted data file");
         let (binary_encrypted_bundle, _): (BinaryEncryptedBundle, usize) =
-            bincode::decode_from_slice(&encrypted_bundle_file[..], config).unwrap();
+            bincode::decode_from_slice(&encrypted_bundle_file[..], config)
+                .expect("could not get the binary encrypted bundle from file");
         Self {
             encrypted_data: binary_encrypted_bundle.encrypted_data,
-            private_key: Private::unmarshall(&binary_encrypted_bundle.private_key)
-                .expect("could not unmarshall private key"),
-            public_key: Public::unmarshall(&binary_encrypted_bundle.public_key)
+            encrypted_symmetric_key: PublicKeyRsa::from_bytes(
+                &binary_encrypted_bundle.encrypted_symmetric_key,
+            )
+            .expect("could not unmarshall encrypted symmetric key"),
+            tpm_public_key: Public::unmarshall(&binary_encrypted_bundle.tpm_public_key)
                 .expect("could not unmarshall public key"),
-            iv: binary_encrypted_bundle
-                .iv
-                .try_into()
-                .expect("could not get IV from encrypted data"),
+            tpm_private_key: Private::unmarshall(&binary_encrypted_bundle.tpm_private_key)
+                .expect("could not unmarshall private key"),
+            nonce: *Nonce::from_slice(&binary_encrypted_bundle.nonce),
         }
     }
 
@@ -90,15 +109,16 @@ impl EncryptedBundle {
         let config = config::standard();
         let binary_encrypted_bundle = BinaryEncryptedBundle {
             encrypted_data: self.encrypted_data,
-            private_key: self
-                .private_key
-                .marshall()
-                .expect("could not marshall private key"),
-            public_key: self
-                .public_key
+            encrypted_symmetric_key: self.encrypted_symmetric_key.to_vec(),
+            tpm_public_key: self
+                .tpm_public_key
                 .marshall()
                 .expect("could not marshall public key"),
-            iv: self.iv.as_bytes().to_vec(),
+            tpm_private_key: self
+                .tpm_private_key
+                .marshall()
+                .expect("could not marshall private key"),
+            nonce: self.nonce.as_slice().to_vec(),
         };
         let encrypted_bundle_file = bincode::encode_to_vec(binary_encrypted_bundle, config)
             .expect("could not encode EncryptedData to binary");
@@ -110,97 +130,91 @@ fn encrypt(mut context: Context) {
     // This example won't go over the process to create a new parent. For more detail see `examples/hmac.rs`.
     let primary = create_primary(&mut context);
 
-    // Create the AES key. This key exists under the primary key in it's hierarchy
-    // and can only be used if the same primary key is recreated from the parameters
-    // defined above.
+    // Begin to create our new RSA key.
     let object_attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_st_clear(false)
         .with_sensitive_data_origin(true)
         .with_user_with_auth(true)
-        .with_sign_encrypt(true)
+        // We need a key that can decrypt values - we don't need to worry
+        // about signatures.
         .with_decrypt(true)
+        // Note that we don't set the key as restricted.
         .build()
         .expect("Failed to build object attributes");
 
-    let key_pub = PublicBuilder::new()
-        // This key is an AES key
-        .with_public_algorithm(PublicAlgorithm::SymCipher)
-        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
-        .with_symmetric_cipher_parameters(SymmetricCipherParameters::new(
-            SymmetricDefinitionObject::AES_128_CFB,
-        ))
-        .with_object_attributes(object_attributes)
-        .with_symmetric_cipher_unique_identifier(Digest::default())
+    let rsa_params = PublicRsaParametersBuilder::new()
+        // The value for scheme may have requirements set by a combination of the
+        // sign, decrypt, and restricted flags. For an unrestricted signing and
+        // decryption key then scheme must be NULL. For an unrestricted decryption key,
+        // NULL, OAEP or RSAES are valid for use.
+        .with_scheme(RsaScheme::Null)
+        .with_key_bits(RsaKeyBits::Rsa2048)
+        .with_exponent(RsaExponent::default())
+        .with_is_decryption_key(true)
+        // We don't require signatures, but some users may.
+        // .with_is_signing_key(true)
+        .with_restricted(false)
         .build()
-        .unwrap();
+        .expect("Failed to build rsa parameters");
+
+    let key_pub = PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::Rsa)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(object_attributes)
+        .with_rsa_parameters(rsa_params)
+        .with_rsa_unique_identifier(PublicKeyRsa::default())
+        .build()
+        .expect("could not configure TPM public key");
 
     let (private, public) = context
         .execute_with_nullauth_session(|ctx| {
-            // Create the AES key given our primary key as it's parent. This returns the private
-            // and public portions of the key. It's *important* to note that the private component
-            // is *encrypted* by a key associated with the primary key. It is not plaintext or
-            // leaked in this step.
             ctx.create(primary.key_handle, key_pub, None, None, None, None)
                 .map(|key| (key.out_private, key.out_public))
         })
-        .unwrap();
+        .expect("could not create TPM child key");
 
-    // We load the data from a file system file, it can be somewhat large (like a certificate), larger than MaxBuffer::MAX_SIZE
-    let initial_data = fs::read(PLAIN_FILE_NAME).expect("could not open data file");
+    // We generate a ChaCha20Poly1305 key that will be used outside of the TPM to encrypt the data (since Intel PTT cannot do EncryptDecrypt(2))
+    let chacha_key = ChaCha20Poly1305::generate_key(&mut OsRng);
+    // We generate a nonce that should be persisted as well for decoding
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
 
-    // We create an initialisation vector, since it is needed for decryption, it should be persisted in a real world use case
-    let iv = context
+    let key_to_encrypt = PublicKeyRsa::try_from(chacha_key.to_vec())
+        .expect("failed to create buffer for key to encrypt");
+
+    // We encrypt the key with the TPM
+    let encrypted_symmetric_key = context
         .execute_with_nullauth_session(|ctx| {
-            InitialValue::from_bytes(
-                ctx.get_random(16)
-                    .expect("could not get random bytes for initialisation vector")
-                    .as_bytes(),
+            let rsa_pub_key = ctx
+                .load_external_public(public.clone(), Hierarchy::Null)
+                .expect("could not load child key into TPM context");
+
+            ctx.rsa_encrypt(
+                rsa_pub_key,
+                key_to_encrypt.clone(),
+                RsaDecryptionScheme::Oaep(HashScheme::new(HashingAlgorithm::Sha1)),
+                Data::default(),
             )
         })
-        .expect("could not create iv from random bytes");
+        .expect("could not encrypt symmetric key with TPM");
+
+    // We load the data from a file system file, it can be somewhat large (like a certificate)
+    let initial_data = fs::read(PLAIN_FILE_NAME).expect("could not open data file");
 
     // We encrypt the data
-    let encrypted_data = context
-        .execute_with_nullauth_session(|ctx| {
-            let mut encrypted_data = Vec::new();
-            let handle = ctx
-                .load(primary.key_handle, private.clone(), public.clone())
-                .expect("could not load child key");
-
-            let mut chunk_iv = iv.clone();
-
-            // This file is larger than the MaxBuffer::MAX_SIZE, so we need to chunk it
-            // The iv must be different for every chunk, the encrypt_decrypt_2 function conveniently provide a new one at each iteration
-            for chunk in initial_data.chunks(MaxBuffer::MAX_SIZE) {
-                let data = MaxBuffer::try_from(Vec::from(chunk))
-                    .expect("failed to create data from file buffer chunk");
-                let (enc_data, chunk_iv_out) = ctx.encrypt_decrypt_2(
-                    handle,             // Handle to a symmetric key
-                    false,              // false, indicates that the data should be encrypted
-                    SymmetricMode::Cfb, // The symmetric mode of the encryption
-                    data,               // The data that is to be encrypted
-                    chunk_iv,           // Initial value needed by the algorithm
-                )?;
-                chunk_iv = chunk_iv_out;
-                encrypted_data.push(enc_data);
-            }
-            Ok::<Vec<MaxBuffer>, tss_esapi::Error>(encrypted_data)
-        })
-        .expect("Call to encrypt_decrypt_2 failed when encrypting data");
-    let encrypted_data = encrypted_data
-        .iter()
-        .map(|e| e.as_bytes())
-        .collect::<Vec<_>>()
-        .concat();
+    let cipher = ChaCha20Poly1305::new(&chacha_key);
+    let encrypted_data = cipher
+        .encrypt(&nonce, initial_data.as_ref())
+        .expect("could not encrypt data");
 
     // Persist the encrypted data, the keys, and the IV for later decryption
     let persisted_data = EncryptedBundle {
         encrypted_data,
-        private_key: private,
-        public_key: public,
-        iv,
+        encrypted_symmetric_key,
+        tpm_public_key: public,
+        tpm_private_key: private,
+        nonce,
     };
     persisted_data.dump_to_file(ENCRYPTED_FILE_NAME);
 }
@@ -209,44 +223,37 @@ fn decrypt(mut context: Context) -> Vec<u8> {
     // This example won't go over the process to create a new parent. For more detail see `examples/hmac.rs`.
     let primary = create_primary(&mut context);
 
-    // Load the EncryptedData
+    // Load the EncryptedBundle
     let encrypted_bundle = EncryptedBundle::from_file(ENCRYPTED_FILE_NAME);
 
-    // Decrypting is exactly the opposite, with the same first iv
-    let decrypted_data = context
+    // Get the chacha20poly1305 key from TPM encrypted data
+    let chacha_key = context
         .execute_with_nullauth_session(|ctx| {
-            let mut decrypted_data = Vec::new();
-            let handle = ctx
+            let rsa_priv_key = ctx
                 .load(
                     primary.key_handle,
-                    encrypted_bundle.private_key,
-                    encrypted_bundle.public_key,
+                    encrypted_bundle.tpm_private_key,
+                    encrypted_bundle.tpm_public_key,
                 )
-                .expect("could not load child key");
+                .expect("could not load TPM child key into context");
 
-            let mut chunk_iv: InitialValue = encrypted_bundle.iv;
-
-            for chunk in encrypted_bundle.encrypted_data.chunks(MaxBuffer::MAX_SIZE) {
-                let data = MaxBuffer::try_from(Vec::from(chunk))
-                    .expect("failed to create data from encrypted data chunk");
-                let (enc_data, chunk_iv_out) = ctx.encrypt_decrypt_2(
-                    handle,             // Handle to a symmetric key
-                    true,               // true, indicates that the data should be decrypted
-                    SymmetricMode::Cfb, // The symmetric mode of the encryption
-                    data,               // The data that is to be encrypted
-                    chunk_iv,           // Initial value needed by the algorithm
-                )?;
-                chunk_iv = chunk_iv_out;
-                decrypted_data.push(enc_data);
-            } //
-            Ok::<Vec<MaxBuffer>, tss_esapi::Error>(decrypted_data)
+            ctx.rsa_decrypt(
+                rsa_priv_key,
+                encrypted_bundle.encrypted_symmetric_key,
+                RsaDecryptionScheme::Oaep(HashScheme::new(HashingAlgorithm::Sha1)),
+                Data::default(),
+            )
         })
-        .expect("Call to encrypt_decrypt_2 failed when encrypting data");
-    decrypted_data
-        .iter()
-        .map(|e| e.as_bytes())
-        .collect::<Vec<_>>()
-        .concat()
+        .expect("could not decrypt symmetric key from TPM encrypted key");
+
+    // Decryt the data using the key
+    let cipher = ChaCha20Poly1305::new(chacha_key.as_bytes().into());
+    cipher
+        .decrypt(
+            &encrypted_bundle.nonce,
+            encrypted_bundle.encrypted_data.as_ref(),
+        )
+        .expect("could not decipher chacha20poly1305 encrypted data")
 }
 
 fn create_primary(context: &mut Context) -> CreatePrimaryKeyResult {
@@ -290,7 +297,7 @@ fn create_primary(context: &mut Context) -> CreatePrimaryKeyResult {
         ))
         .with_symmetric_cipher_unique_identifier(Digest::default())
         .build()
-        .unwrap();
+        .expect("could not configure TPM primary key");
 
     context
         .execute_with_nullauth_session(|ctx| {
@@ -299,5 +306,5 @@ fn create_primary(context: &mut Context) -> CreatePrimaryKeyResult {
             // and endorsement which allows key certification by the TPM manufacturer.
             ctx.create_primary(Hierarchy::Owner, primary_pub, None, None, None, None)
         })
-        .unwrap()
+        .expect("could not create TPM primary key")
 }

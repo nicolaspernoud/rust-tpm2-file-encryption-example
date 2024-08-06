@@ -35,3 +35,5 @@ RUN git clone --depth 1 --branch 4.1.3 https://github.com/tpm2-software/tpm2-tss
     ./configure --prefix=/usr  && \
     make -j5  && \
     make install
+
+RUN rustup component add rustfmt && rustup component add clippy
