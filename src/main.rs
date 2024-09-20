@@ -8,14 +8,9 @@ use chacha20poly1305::Nonce;
 use core::str;
 use std::env;
 use std::fs;
-use tss_esapi::interface_types::key_bits::RsaKeyBits;
-use tss_esapi::structures::Data;
-use tss_esapi::structures::HashScheme;
-use tss_esapi::structures::PublicKeyRsa;
-use tss_esapi::structures::PublicRsaParametersBuilder;
-use tss_esapi::structures::RsaDecryptionScheme;
-use tss_esapi::structures::RsaExponent;
-use tss_esapi::structures::RsaScheme;
+use tss_esapi::structures::KeyedHashScheme;
+use tss_esapi::structures::PublicKeyedHashParameters;
+use tss_esapi::structures::SensitiveData;
 use tss_esapi::structures::{Private, Public};
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::{
@@ -69,7 +64,6 @@ fn main() {
 #[derive(Encode, Decode, PartialEq, Debug)]
 struct BinaryEncryptedBundle {
     encrypted_data: Vec<u8>,
-    encrypted_symmetric_key: Vec<u8>,
     tpm_public_key: Vec<u8>,
     tpm_private_key: Vec<u8>,
     nonce: Vec<u8>,
@@ -78,7 +72,6 @@ struct BinaryEncryptedBundle {
 #[derive(PartialEq, Debug)]
 pub struct EncryptedBundle {
     encrypted_data: Vec<u8>,
-    encrypted_symmetric_key: PublicKeyRsa,
     tpm_public_key: Public,
     tpm_private_key: Private,
     nonce: Nonce,
@@ -93,10 +86,6 @@ impl EncryptedBundle {
                 .expect("could not get the binary encrypted bundle from file");
         Self {
             encrypted_data: binary_encrypted_bundle.encrypted_data,
-            encrypted_symmetric_key: PublicKeyRsa::from_bytes(
-                &binary_encrypted_bundle.encrypted_symmetric_key,
-            )
-            .expect("could not unmarshall encrypted symmetric key"),
             tpm_public_key: Public::unmarshall(&binary_encrypted_bundle.tpm_public_key)
                 .expect("could not unmarshall public key"),
             tpm_private_key: Private::unmarshall(&binary_encrypted_bundle.tpm_private_key)
@@ -109,7 +98,6 @@ impl EncryptedBundle {
         let config = config::standard();
         let binary_encrypted_bundle = BinaryEncryptedBundle {
             encrypted_data: self.encrypted_data,
-            encrypted_symmetric_key: self.encrypted_symmetric_key.to_vec(),
             tpm_public_key: self
                 .tpm_public_key
                 .marshall()
@@ -130,74 +118,60 @@ fn encrypt(mut context: Context) {
     // This example won't go over the process to create a new parent. For more detail see `examples/hmac.rs`.
     let primary = create_primary(&mut context);
 
-    // Begin to create our new RSA key.
-    let object_attributes = ObjectAttributesBuilder::new()
-        .with_fixed_tpm(true)
-        .with_fixed_parent(true)
-        .with_st_clear(false)
-        .with_sensitive_data_origin(true)
-        .with_user_with_auth(true)
-        // We need a key that can decrypt values - we don't need to worry
-        // about signatures.
-        .with_decrypt(true)
-        // Note that we don't set the key as restricted.
-        .build()
-        .expect("Failed to build object attributes");
-
-    let rsa_params = PublicRsaParametersBuilder::new()
-        // The value for scheme may have requirements set by a combination of the
-        // sign, decrypt, and restricted flags. For an unrestricted signing and
-        // decryption key then scheme must be NULL. For an unrestricted decryption key,
-        // NULL, OAEP or RSAES are valid for use.
-        .with_scheme(RsaScheme::Null)
-        .with_key_bits(RsaKeyBits::Rsa2048)
-        .with_exponent(RsaExponent::default())
-        .with_is_decryption_key(true)
-        // We don't require signatures, but some users may.
-        // .with_is_signing_key(true)
-        .with_restricted(false)
-        .build()
-        .expect("Failed to build rsa parameters");
-
-    let key_pub = PublicBuilder::new()
-        .with_public_algorithm(PublicAlgorithm::Rsa)
-        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
-        .with_object_attributes(object_attributes)
-        .with_rsa_parameters(rsa_params)
-        .with_rsa_unique_identifier(PublicKeyRsa::default())
-        .build()
-        .expect("could not configure TPM public key");
-
-    let (private, public) = context
-        .execute_with_nullauth_session(|ctx| {
-            ctx.create(primary.key_handle, key_pub, None, None, None, None)
-                .map(|key| (key.out_private, key.out_public))
-        })
-        .expect("could not create TPM child key");
-
     // We generate a ChaCha20Poly1305 key that will be used outside of the TPM to encrypt the data (since Intel PTT cannot do EncryptDecrypt(2))
     let chacha_key = ChaCha20Poly1305::generate_key(&mut OsRng);
     // We generate a nonce that should be persisted as well for decoding
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
 
-    let key_to_encrypt = PublicKeyRsa::try_from(chacha_key.to_vec())
-        .expect("failed to create buffer for key to encrypt");
+    let sensitive_data = SensitiveData::try_from(chacha_key.to_vec())
+        .expect("could not convert chacha key to sensitive data");
 
-    // We encrypt the key with the TPM
-    let encrypted_symmetric_key = context
+    // A sealed data object is a specialised form of a HMAC key. There are strict requirements for
+    // the object attributes and algorithms to signal to the TPM that this is a sealed data object.
+    let object_attributes = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_st_clear(true)
+        // To access the sealed data we require user auth or policy. In this example we
+        // set a null authValue.
+        .with_user_with_auth(true)
+        // Must be clear (not set). This is because the sensitive data is
+        // input from an external source.
+        // .with_sensitive_data_origin(true)
+        // For sealed data, none of sign, decrypt or restricted can be set. This indicates
+        // the created object is a sealed data object.
+        // .with_decrypt(false)
+        // .with_restricted(false)
+        // .with_sign_encrypt(false)
+        .build()
+        .expect("Failed to build object attributes");
+
+    let key_pub = PublicBuilder::new()
+        // A sealed data object is an HMAC key with a NULL hash scheme.
+        .with_public_algorithm(PublicAlgorithm::KeyedHash)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(object_attributes)
+        .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
+        .with_keyed_hash_unique_identifier(Digest::default())
+        .build()
+        .unwrap();
+
+    let (private, public) = context
         .execute_with_nullauth_session(|ctx| {
-            let rsa_pub_key = ctx
-                .load_external_public(public.clone(), Hierarchy::Null)
-                .expect("could not load child key into TPM context");
-
-            ctx.rsa_encrypt(
-                rsa_pub_key,
-                key_to_encrypt.clone(),
-                RsaDecryptionScheme::Oaep(HashScheme::new(HashingAlgorithm::Sha1)),
-                Data::default(),
+            // Create the sealed data object. The encrypted private component is now encrypted and
+            // contains our data. Like any other TPM object, to load this we require the public
+            // component as well. Both should be persisted for future use.
+            ctx.create(
+                primary.key_handle,
+                key_pub,
+                None,
+                Some(sensitive_data.clone()),
+                None,
+                None,
             )
+            .map(|key| (key.out_private, key.out_public))
         })
-        .expect("could not encrypt symmetric key with TPM");
+        .unwrap();
 
     // We load the data from a file system file, it can be somewhat large (like a certificate)
     let initial_data = fs::read(PLAIN_FILE_NAME).expect("could not open data file");
@@ -211,7 +185,6 @@ fn encrypt(mut context: Context) {
     // Persist the encrypted data, the keys, and the IV for later decryption
     let persisted_data = EncryptedBundle {
         encrypted_data,
-        encrypted_symmetric_key,
         tpm_public_key: public,
         tpm_private_key: private,
         nonce,
@@ -227,27 +200,24 @@ fn decrypt(mut context: Context) -> Vec<u8> {
     let encrypted_bundle = EncryptedBundle::from_file(ENCRYPTED_FILE_NAME);
 
     // Get the chacha20poly1305 key from TPM encrypted data
-    let chacha_key = context
+    let unsealed = context
         .execute_with_nullauth_session(|ctx| {
-            let rsa_priv_key = ctx
+            // When we wish to unseal the data, we must load this object like any other meeting
+            // any policy or authValue requirements.
+            let sealed_data_object = ctx
                 .load(
                     primary.key_handle,
                     encrypted_bundle.tpm_private_key,
                     encrypted_bundle.tpm_public_key,
                 )
-                .expect("could not load TPM child key into context");
+                .unwrap();
 
-            ctx.rsa_decrypt(
-                rsa_priv_key,
-                encrypted_bundle.encrypted_symmetric_key,
-                RsaDecryptionScheme::Oaep(HashScheme::new(HashingAlgorithm::Sha1)),
-                Data::default(),
-            )
+            ctx.unseal(sealed_data_object.into())
         })
-        .expect("could not decrypt symmetric key from TPM encrypted key");
+        .expect("could not unseal symmetric key from TPM");
 
     // Decryt the data using the key
-    let cipher = ChaCha20Poly1305::new(chacha_key.as_bytes().into());
+    let cipher = ChaCha20Poly1305::new(unsealed.as_bytes().into());
     cipher
         .decrypt(
             &encrypted_bundle.nonce,
