@@ -8,6 +8,7 @@ use chacha20poly1305::Nonce;
 use core::str;
 use std::env;
 use std::fs;
+use tss_esapi::structures::Auth;
 use tss_esapi::structures::KeyedHashScheme;
 use tss_esapi::structures::PublicKeyedHashParameters;
 use tss_esapi::structures::SensitiveData;
@@ -156,6 +157,10 @@ fn encrypt(mut context: Context) {
         .build()
         .unwrap();
 
+    // Set password
+    let password_auth = Auth::try_from("mypassword".as_bytes().to_vec())
+        .expect("failed to create authentication value");
+
     let (private, public) = context
         .execute_with_nullauth_session(|ctx| {
             // Create the sealed data object. The encrypted private component is now encrypted and
@@ -164,7 +169,7 @@ fn encrypt(mut context: Context) {
             ctx.create(
                 primary.key_handle,
                 key_pub,
-                None,
+                Some(password_auth),
                 Some(sensitive_data.clone()),
                 None,
                 None,
@@ -211,6 +216,12 @@ fn decrypt(mut context: Context) -> Vec<u8> {
                     encrypted_bundle.tpm_public_key,
                 )
                 .unwrap();
+
+            // Set password
+            let password_auth = Auth::try_from("mypassword".as_bytes().to_vec())
+                .expect("failed to create authentication value");
+            ctx.tr_set_auth(sealed_data_object.into(), password_auth)
+                .expect("could not set auth password for unsealing");
 
             ctx.unseal(sealed_data_object.into())
         })
